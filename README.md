@@ -42,10 +42,6 @@ Para encerrar, pressione `q` ou feche a janela.
 - Portabilidade do alerta sonoro para outros sistemas operacionais
 - Testes quantitativos em diferentes condições de iluminação
 
-## Demonstração
-
-![Demonstração](link-do-gif-ou-print)
-
 ## Autor
 
 Luis Francisco Bezerra Barbosa
