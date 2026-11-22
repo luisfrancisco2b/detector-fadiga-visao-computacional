@@ -1,138 +1,271 @@
-import cv2
+"""
+Detector de Fadiga - versão refatorada e robusta.
+
+Melhorias em relação à versão anterior:
+- Abertura da webcam com fallback entre backends do Windows.
+- Carregamento dos classificadores Haar validado (erro claro se faltarem).
+- Sons tocados em thread separada, sem travar o vídeo.
+- Bipes intermitentes em vez de um bipe a cada frame.
+- CLAHE criado uma única vez (antes era recriado a cada frame).
+- Proteção contra divisão por zero no cálculo de FPS.
+- Tolerância a falhas pontuais de leitura da câmera.
+- Encerramento limpo com 'q', ESC ou fechando a janela.
+"""
+
+import os
+import sys
 import time
-import winsound
+import threading
+
+import cv2
+
+try:
+    import winsound  # Disponível apenas no Windows
+    SOM_DISPONIVEL = True
+except ImportError:
+    winsound = None
+    SOM_DISPONIVEL = False
+
 
 # ==========================================
-# CONFIGURAÇÕES E CONSTANTES
+# CONFIGURAÇÕES
 # ==========================================
-# Carrega os classificadores pré-treinados do OpenCV
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
+INDICE_CAMERA = 0
+LARGURA_CAPTURA = 1920#640
+ALTURA_CAPTURA = 1080#480
 
-# Parâmetros de calibração do detector
-TEMPO_LIMIAR_FADIGA = 1.5  # Segundos de olhos fechados para disparar o alarme definitivo
-MIN_FRAMES_VALIDACAO = 5   # Mínimo de frames sem olhos para confirmar o fechamento (evita ruído)
+TEMPO_LIMIAR_FADIGA = 1.5    # Segundos com olhos fechados para alerta crítico
+MIN_FRAMES_VALIDACAO = 5     # Frames seguidos sem olhos para confirmar fechamento
+INTERVALO_BIP = 0.8          # Segundos entre bipes de alerta intermediário
+MAX_FALHAS_LEITURA = 30      # Falhas seguidas de leitura toleradas antes de encerrar
 
+NOME_JANELA = "Sistema de Monitoramento de Fadiga v2.1"
+
+
+# ==========================================
+# UTILITÁRIOS
+# ==========================================
+def carregar_classificador(nome_arquivo):
+    """Carrega um classificador Haar e garante que ele foi lido corretamente."""
+    try:
+        base = cv2.data.haarcascades
+    except AttributeError:
+        # Algumas instalações não expõem cv2.data; usa a pasta do próprio pacote
+        base = os.path.join(os.path.dirname(cv2.__file__), "data")
+
+    caminho = os.path.join(base, nome_arquivo)
+    classificador = cv2.CascadeClassifier(caminho)
+
+    if classificador.empty():
+        raise RuntimeError(
+            f"Não foi possível carregar o classificador: {caminho}\n"
+            "Verifique se a instalação do opencv-python está correta."
+        )
+    return classificador
+
+
+def abrir_camera(indice):
+    """Tenta abrir a webcam com diferentes backends. Retorna None se falhar."""
+    if sys.platform.startswith("win"):
+        backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+    else:
+        backends = [cv2.CAP_ANY]
+
+    for backend in backends:
+        cap = cv2.VideoCapture(indice, backend)
+        if cap.isOpened():
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, LARGURA_CAPTURA)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, ALTURA_CAPTURA)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduz atraso entre câmera e tela
+            ok, _ = cap.read()
+            if ok:
+                return cap
+        cap.release()
+    return None
+
+
+class Alarme:
+    """Toca sons em thread separada, para não travar o processamento do vídeo."""
+
+    def __init__(self):
+        self._ocupado = False
+        self._lock = threading.Lock()
+
+    def tocar(self, frequencia, duracao_ms):
+        if not SOM_DISPONIVEL:
+            return
+
+        with self._lock:
+            if self._ocupado:
+                return  # Já há um som tocando; ignora este para não acumular
+            self._ocupado = True
+
+        def _executar():
+            try:
+                winsound.Beep(frequencia, duracao_ms)
+            except RuntimeError:
+                pass  # Falha de hardware de áudio não deve derrubar o programa
+            finally:
+                with self._lock:
+                    self._ocupado = False
+
+        threading.Thread(target=_executar, daemon=True).start()
+
+
+def desenhar_texto(img, texto, posicao, cor, escala=0.8, espessura=2, fonte=cv2.FONT_HERSHEY_SIMPLEX):
+    cv2.putText(img, texto, posicao, fonte, escala, cor, espessura, cv2.LINE_AA)
+
+
+# ==========================================
+# DETECÇÃO
+# ==========================================
+def detectar_olhos_no_rosto(roi_cinza, eye_cascade, w, h):
+    """Detecta olhos na metade superior do rosto."""
+    min_olho = (max(int(w / 10), 1), max(int(h / 10), 1))
+    return eye_cascade.detectMultiScale(
+        roi_cinza, scaleFactor=1.1, minNeighbors=8, minSize=min_olho
+    )
+
+
+# ==========================================
+# LOOP PRINCIPAL
+# ==========================================
 def iniciar_detector():
-    # Inicializa a captura da webcam
-    cap = cv2.VideoCapture(0)
-    
-    # Variáveis de estado e temporização
-    inicio_fechado = None
-    contador_frames_fechados = 0
-    
-    # Variáveis para cálculo de FPS (Desempenho)
-    tempo_anterior = 0
-    
-    nome_janela = 'Sistema de Monitoramento de Fadiga v2.0'
-    cv2.namedWindow(nome_janela)
-    
+    face_cascade = carregar_classificador("haarcascade_frontalface_default.xml")
+    eye_cascade = carregar_classificador("haarcascade_eye.xml")
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    alarme = Alarme()
+
+    cap = abrir_camera(INDICE_CAMERA)
+    if cap is None:
+        raise RuntimeError(
+            f"Não foi possível abrir a webcam (índice {INDICE_CAMERA}).\n"
+            "Verifique se a câmera está conectada, se nenhum outro programa a está usando "
+            "e se o Windows permite acesso à câmera (Configurações > Privacidade > Câmera)."
+        )
+
+    cv2.namedWindow(NOME_JANELA, cv2.WINDOW_AUTOSIZE)
+
     print("=== DETECTOR DE FADIGA ATIVADO ===")
-    print("Orientações: Mantenha o rosto bem iluminado.")
-    print("Para encerrar: Pressione 'q' ou clique no 'X' da janela.")
-    
-    while cap.isOpened():
-        sucesso, frame = cap.read()
-        if not sucesso:
-            print("Erro: Não foi possível acessar o fluxo da câmera.")
-            break
-            
-        # Otimização: Espelha a imagem para parecer um espelho (mais natural para o usuário)
-        frame = cv2.flip(frame, 1)
-        h_tela, w_tela, _ = frame.shape
-        
-        # Processamento digital: Conversão para escala de cinza com CLAHE
-        frame_cinza_raw = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        frame_cinza = clahe.apply(frame_cinza_raw)
-        
-        # Detecção facial
-        rostos = face_cascade.detectMultiScale(frame_cinza, scaleFactor=1.2, minNeighbors=5, minSize=(100, 100))
-        olhos_detectados = False
-        
-        for (x, y, w, h) in rostos:
-            # Desenha um retângulo suave sobre o rosto detectado
-            cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 100, 0), 2)
-            
-            # Recorta a Região de Interesse (ROI) do rosto (apenas metade superior)
-            roi_h = int(h / 2)
-            roi_cinza = frame_cinza[y:y+roi_h, x:x+w]
-            roi_cor = frame[y:y+roi_h, x:x+w]
-            
-            # minSize Dinâmico para os Olhos
-            min_size_olhos = (int(w / 10), int(h / 10))
-            
-            # Detecta os olhos estritamente na metade superior da região do rosto
-            olhos = eye_cascade.detectMultiScale(roi_cinza, scaleFactor=1.1, minNeighbors=8, minSize=min_size_olhos)
-            
-            if len(olhos) > 0:
-                olhos_detectados = True
-                for (ex, ey, ew, eh) in olhos:
-                    # Desenha um círculo no centro de cada olho detectado
-                    centro_x = int(ex + ew / 2)
-                    centro_y = int(ey + eh / 2)
-                    cv2.circle(roi_cor, (centro_x, centro_y), int(ew / 3), (0, 255, 255), 2)
+    print("Dica: mantenha o rosto bem iluminado e de frente para a câmera.")
+    print("Para encerrar: pressione 'q' ou ESC, ou feche a janela.")
 
-        # LÓGICA DE TOMADA DE DECISÃO DA IA
-        if len(rostos) > 0 and not olhos_detectados:
-            # Incrementa o contador de estabilização
-            contador_frames_fechados += 1
-            
-            # Só assume que o olho fechou se passar do mínimo de frames de segurança
-            if contador_frames_fechados >= MIN_FRAMES_VALIDACAO:
-                if inicio_fechado is None:
-                    inicio_fechado = time.time()
-                
-                tempo_decorrido = time.time() - inicio_fechado
-                
-                # Alerta sonoro de teste (olhos fechados detectados no momento)
-                winsound.Beep(2200, 40)
-                
-                # Condição de Fadiga Crítica
-                if tempo_decorrido >= TEMPO_LIMIAR_FADIGA:
-                    # Efeito visual: Alerta crítico piscante (Borda vermelha na tela)
-                    cv2.rectangle(frame, (0, 0), (w_tela, h_tela), (0, 0, 255), 20)
-                    cv2.putText(frame, "ALERTA: MOTORISTA DORMINDO!", (int(w_tela*0.1), int(h_tela*0.5)), 
-                                cv2.FONT_HERSHEY_DUPLEX, 1.0, (0, 0, 255), 3)
-                    
-                    # Alarme sonoro grave do sistema
-                    winsound.Beep(1200, 150)
-                else:
-                    # Status intermediário: Piscada longa ou início de sonolência
-                    cv2.putText(frame, "Status: Olhos Fechados...", (30, 40), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
-        else:
-            # Reseta os temporizadores e contadores se os olhos estiverem abertos
-            inicio_fechado = None
-            contador_frames_fechados = 0
-            
-            if len(rostos) > 0:
-                cv2.putText(frame, "Status: Alerta (Acordado)", (30, 40), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+    # Estado
+    inicio_fechado = None
+    frames_sem_olhos = 0
+    ultimo_bip = 0.0
+    falhas_leitura = 0
+    tempo_anterior = time.time()
+    fps_suavizado = 0.0
+
+    try:
+        while True:
+            sucesso, frame = cap.read()
+            if not sucesso:
+                falhas_leitura += 1
+                if falhas_leitura >= MAX_FALHAS_LEITURA:
+                    print("Erro: a câmera parou de enviar imagens.")
+                    break
+                time.sleep(0.05)
+                continue
+            falhas_leitura = 0
+
+            # Espelha a imagem para ficar mais natural
+            frame = cv2.flip(frame, 1)
+            altura_tela, largura_tela = frame.shape[:2]
+
+            # Pré-processamento
+            cinza = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            cinza = clahe.apply(cinza)
+
+            # Detecção de rosto
+            rostos = face_cascade.detectMultiScale(
+                cinza, scaleFactor=1.2, minNeighbors=5, minSize=(100, 100)
+            )
+
+            olhos_detectados = False
+            for (x, y, w, h) in rostos:
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 100, 0), 2)
+
+                roi_h = max(int(h / 2), 1)  # Metade superior do rosto
+                roi_cinza = cinza[y:y + roi_h, x:x + w]
+                roi_cor = frame[y:y + roi_h, x:x + w]
+
+                olhos = detectar_olhos_no_rosto(roi_cinza, eye_cascade, w, h)
+                if len(olhos) > 0:
+                    olhos_detectados = True
+                    for (ex, ey, ew, eh) in olhos:
+                        centro = (int(ex + ew / 2), int(ey + eh / 2))
+                        cv2.circle(roi_cor, centro, max(int(ew / 3), 1), (0, 255, 255), 2)
+
+            # Lógica de decisão
+            agora = time.time()
+
+            if len(rostos) > 0 and not olhos_detectados:
+                frames_sem_olhos += 1
+
+                if frames_sem_olhos >= MIN_FRAMES_VALIDACAO:
+                    if inicio_fechado is None:
+                        inicio_fechado = agora
+
+                    tempo_decorrido = agora - inicio_fechado
+
+                    if tempo_decorrido >= TEMPO_LIMIAR_FADIGA:
+                        # Alerta crítico: borda vermelha piscante + mensagem + som grave
+                        if int(agora * 4) % 2 == 0:
+                            cv2.rectangle(frame, (0, 0), (largura_tela - 1, altura_tela - 1),
+                                          (0, 0, 255), 20)
+                        desenhar_texto(frame, "ALERTA: MOTORISTA DORMINDO!",
+                                       (int(largura_tela * 0.1), int(altura_tela * 0.5)),
+                                       (0, 0, 255), escala=1.0, espessura=3,
+                                       fonte=cv2.FONT_HERSHEY_DUPLEX)
+                        alarme.tocar(1200, 300)
+                    else:
+                        # Estado intermediário: bipes espaçados, não contínuos
+                        desenhar_texto(frame, "Status: Olhos Fechados...", (30, 40), (0, 165, 255))
+                        if agora - ultimo_bip >= INTERVALO_BIP:
+                            alarme.tocar(2200, 60)
+                            ultimo_bip = agora
             else:
-                cv2.putText(frame, "Status: Rosto ausente", (30, 40), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (128, 128, 128), 2)
+                # Olhos abertos ou rosto ausente: reseta o estado
+                inicio_fechado = None
+                frames_sem_olhos = 0
 
-        # CÁLCULO E EXIBIÇÃO DO DESEMPENHO (FPS)
-        tempo_atual = time.time()
-        fps = 1 / (tempo_atual - tempo_anterior)
-        tempo_anterior = tempo_atual
-        cv2.putText(frame, f"FPS: {int(fps)}", (w_tela - 130, 40), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                if len(rostos) > 0:
+                    desenhar_texto(frame, "Status: Alerta (Acordado)", (30, 40), (0, 255, 0))
+                else:
+                    desenhar_texto(frame, "Status: Rosto ausente", (30, 40), (128, 128, 128))
 
-        # Renderiza a janela final do software
-        cv2.imshow(nome_janela, frame)
-        
-        # Mecanismos de saída seguros (evitam o travamento do Windows)
-        if cv2.waitKey(20) & 0xFF == ord('q'):
-            break
-        if cv2.getWindowProperty(nome_janela, cv2.WND_PROP_VISIBLE) < 1:
-            break
-            
-    # Liberação limpa de recursos de hardware e interface
-    cap.release()
-    cv2.destroyAllWindows()
-    print("=== SISTEMA ENCERRADO COM SUCESSO ===")
+            # FPS suavizado, protegido contra divisão por zero
+            dt = max(agora - tempo_anterior, 1e-6)
+            fps_suavizado = 0.9 * fps_suavizado + 0.1 * (1.0 / dt) if fps_suavizado else 1.0 / dt
+            tempo_anterior = agora
+            desenhar_texto(frame, f"FPS: {int(fps_suavizado)}",
+                           (largura_tela - 130, 40), (255, 255, 255), escala=0.6, espessura=1)
+
+            cv2.imshow(NOME_JANELA, frame)
+
+            tecla = cv2.waitKey(1) & 0xFF
+            if tecla in (ord("q"), 27):  # 'q' ou ESC
+                break
+
+            try:
+                if cv2.getWindowProperty(NOME_JANELA, cv2.WND_PROP_VISIBLE) < 1:
+                    break
+            except cv2.error:
+                break  # Janela foi fechada
+
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        print("=== SISTEMA ENCERRADO ===")
+
 
 if __name__ == "__main__":
-    iniciar_detector()
+    try:
+        iniciar_detector()
+    except Exception as erro:
+        print(f"\nERRO: {erro}")
+        if sys.platform.startswith("win"):
+            input("\nPressione Enter para sair...")
+        sys.exit(1)
